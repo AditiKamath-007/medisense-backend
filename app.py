@@ -8,7 +8,6 @@ import os
 import json
 import datetime
 import functools
-import asyncio
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -359,22 +358,18 @@ def analyze_symptoms():
         return jsonify({"error": str(e)}), 502
 
 # ---------------------------------------------------------------------------
-# Text-to-speech (Edge TTS) — fixes "read aloud" for non-English languages
+# Text-to-speech (gTTS) — fixes "read aloud" for non-English languages.
+# (edge-tts was switched out: Microsoft blocks its WebSocket service from
+# cloud-hosting IP ranges like Render's with a 403, so it never worked once
+# deployed even though it worked in local testing.)
 # ---------------------------------------------------------------------------
-import edge_tts
+from gtts import gTTS
+import io
 
-# One reliable neural voice per language — these all genuinely speak the
-# language natively (unlike the old browser/ResponsiveVoice fallback chain).
-VOICE_MAP = {
-    "en": "en-IN-NeerjaNeural",
-    "hi": "hi-IN-SwaraNeural",
-    "kn": "kn-IN-SapnaNeural",
-    "te": "te-IN-ShrutiNeural",
-    "ta": "ta-IN-PallaviNeural",
-    "mr": "mr-IN-AarohiNeural",
-    "gu": "gu-IN-DhwaniNeural",
-    "bn": "bn-IN-TanishaaNeural",
-    "ml": "ml-IN-SobhanaNeural",
+# gTTS language codes for each option in the app's language dropdown.
+LANG_CODE_MAP = {
+    "en": "en", "hi": "hi", "kn": "kn", "te": "te",
+    "ta": "ta", "mr": "mr", "gu": "gu", "bn": "bn", "ml": "ml",
 }
 
 
@@ -388,25 +383,16 @@ def tts():
     if len(text) > 2000:
         text = text[:2000]
 
-    voice = VOICE_MAP.get(lang, VOICE_MAP["en"])
-    out_path = f"/tmp/tts_{os.getpid()}_{abs(hash(text)) % 100000}.mp3"
-
-    async def _gen():
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(out_path)
-
+    gtts_lang = LANG_CODE_MAP.get(lang, "en")
     try:
-        asyncio.run(_gen())
-        return send_file(out_path, mimetype="audio/mpeg")
+        tts_obj = gTTS(text=text, lang=gtts_lang)
+        buf = io.BytesIO()
+        tts_obj.write_to_fp(buf)
+        buf.seek(0)
+        return send_file(buf, mimetype="audio/mpeg", download_name="speech.mp3")
     except Exception as e:
+        logger.exception("tts() failed")
         return jsonify({"error": f"TTS failed: {e}"}), 502
-    finally:
-        try:
-            if os.path.exists(out_path):
-                # Clean up after response is sent (best effort, next request will overwrite anyway)
-                pass
-        except Exception:
-            pass
 
 
 @app.errorhandler(Exception)
