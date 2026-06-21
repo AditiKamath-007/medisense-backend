@@ -5,6 +5,7 @@ Run locally:  python app.py
 Deploy:       gunicorn app:app   (see README.md)
 """
 import os
+import json
 import datetime
 import functools
 import asyncio
@@ -260,28 +261,47 @@ def delete_appt(aid):
 # ---------------------------------------------------------------------------
 # AI chat + symptom checker (Groq proxy — key never reaches the browser)
 # ---------------------------------------------------------------------------
-import urllib.request
-import json as _json
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("medisense")
 
 def _call_groq(messages, max_tokens=500, temperature=0.7):
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not configured on the server")
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/chat/completions",
-        data=_json.dumps({
-            "model": "llama-3.3-70b-versatile",
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = _json.loads(resp.read().decode())
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+            },
+            timeout=20,
+        )
+    except requests.exceptions.Timeout:
+        raise RuntimeError("Groq request timed out — try again")
+    except requests.exceptions.RequestException as e:
+        logger.exception("Groq network error")
+        raise RuntimeError(f"Could not reach Groq: {e}")
+
+    if resp.status_code != 200:
+        # Surface Groq's actual error message instead of crashing blind
+        try:
+            body = resp.json()
+            msg = body.get("error", {}).get("message", resp.text[:300])
+        except Exception:
+            msg = resp.text[:300]
+        logger.error("Groq returned %s: %s", resp.status_code, msg)
+        raise RuntimeError(f"Groq API error ({resp.status_code}): {msg}")
+
+    data = resp.json()
     if "error" in data:
         raise RuntimeError(data["error"].get("message", "Groq error"))
     return data["choices"][0]["message"]["content"]
@@ -307,6 +327,7 @@ def chat():
         reply = _call_groq(messages, max_tokens=500, temperature=0.7)
         return jsonify({"reply": reply})
     except Exception as e:
+        logger.exception("chat() failed")
         return jsonify({"error": str(e)}), 502
 
 
@@ -331,9 +352,10 @@ def analyze_symptoms():
     try:
         raw = _call_groq(messages, max_tokens=1000, temperature=0.7)
         cleaned = raw.replace("```json", "").replace("```", "").strip()
-        result = _json.loads(cleaned)
+        result = json.loads(cleaned)
         return jsonify(result)
     except Exception as e:
+        logger.exception("analyze_symptoms() failed")
         return jsonify({"error": str(e)}), 502
 
 # ---------------------------------------------------------------------------
@@ -385,6 +407,12 @@ def tts():
                 pass
         except Exception:
             pass
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    logger.exception("Unhandled error")
+    return jsonify({"error": f"Server error: {e}"}), 500
 
 
 @app.route("/api/health", methods=["GET"])
